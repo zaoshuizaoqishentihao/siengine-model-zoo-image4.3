@@ -1,9 +1,9 @@
 name: build-model-zoo-image
 
-# 单文件版：把 Dockerfile 内联在 workflow 里，仓库里只需要这一个文件。
-# 用法：GitHub 仓库 → Add file → Create new file → 文件名填
-#   .github/workflows/build-image.yml
-# 粘贴本文件 → Commit → Actions → build-model-zoo-image → Run workflow。
+# 单文件版：Dockerfile 内联 + 构建后导出镜像 artifact，便于用浏览器下载。
+# 用法：.github/workflows/build-image.yml 粘贴本文件 → Commit
+#       → Actions → build-model-zoo-image → Run workflow (tag=v0.4.3)
+# 完成后在 run 页面底部 "Artifacts" 下载 siengine-model-zoo-v0.4.3。
 
 on:
   workflow_dispatch:
@@ -191,7 +191,24 @@ jobs:
             echo SMOKE_TEST_OK
           '
 
+      - name: Export image for browser download
+        run: |
+          IMG="ghcr.io/${{ github.repository }}:${{ inputs.tag }}"
+          mkdir -p /tmp/artifact
+          docker save "$IMG" | zstd -T0 -3 | split -b 1900M - /tmp/artifact/image.tar.zst.part-
+          sha256sum /tmp/artifact/image.tar.zst.part-* > /tmp/artifact/SHA256SUMS
+          ls -lh /tmp/artifact
+          df -h /
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siengine-model-zoo-${{ inputs.tag }}
+          path: /tmp/artifact/*
+          compression-level: 0
+          retention-days: 7
+
       - name: Show image size
         run: |
           IMG="ghcr.io/${{ github.repository }}:${{ inputs.tag }}"
-          docker image inspect "$IMG" --format 'image={{.RepoTags}} size={{.Size}}'
+          docker image inspect "$IMG" --format 'image={{.RepoTags}} size={{.Size}
