@@ -80,13 +80,15 @@ jobs:
           # ---------------------------------------------------------------------------
           FROM ${BASE_IMAGE}
 
-          # ARGs declared before the first FROM are global-only; re-declare them inside
-          # the stage (without values) so ${TOOLCHAIN_URL} etc. are usable here.
-          ARG TOOLCHAIN_URL
-          ARG TOOLCHAIN_MD5
-          ARG ORT_VERSION
-          ARG ORT_URL
-          ARG ORT_SHA256
+          # ARGs declared before the first FROM are global-only and are NOT inherited by
+          # the stages automatically: re-declare them here WITH their defaults.
+          # (If this block sits in the wrong stage, TOOLCHAIN_URL arrives empty and curl
+          # fails with "URL using bad/illegal format or missing URL".)
+          ARG TOOLCHAIN_URL=https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.tar.xz
+          ARG TOOLCHAIN_MD5=07bbe2b5277b75ba36a924e9136366a4
+          ARG ORT_VERSION=1.22.0
+          ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+          ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
 
           ENV DEBIAN_FRONTEND=noninteractive
 
@@ -98,18 +100,33 @@ jobs:
               && ln -s /usr/bin/make /usr/bin/gmake
 
           # ARM cross toolchain (MX envsetup looks for this exact directory name).
-          RUN curl -fsSL -o /tmp/toolchain.tar.xz "${TOOLCHAIN_URL}" \
-           && echo "${TOOLCHAIN_MD5}  /tmp/toolchain.tar.xz" | md5sum -c - \
-           && tar -xf /tmp/toolchain.tar.xz -C /opt \
-           && rm -f /tmp/toolchain.tar.xz \
-           && test -d /opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin
+          # NOTE: the ${VAR:-default} fallbacks keep this working even if the build is
+          # invoked with --build-arg TOOLCHAIN_URL= (empty) or without any build-arg.
+          RUN set -eux; \
+              url="${TOOLCHAIN_URL:-https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.tar.xz}"; \
+              md5="${TOOLCHAIN_MD5:-07bbe2b5277b75ba36a924e9136366a4}"; \
+              test -n "${url}" || { echo "ERROR: TOOLCHAIN_URL is empty"; exit 1; }; \
+              echo "toolchain url = ${url}"; \
+              echo "toolchain md5 = ${md5}"; \
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -o /tmp/toolchain.tar.xz "${url}"; \
+              echo "${md5}  /tmp/toolchain.tar.xz" | md5sum -c -; \
+              tar -xf /tmp/toolchain.tar.xz -C /opt; \
+              rm -f /tmp/toolchain.tar.xz; \
+              test -d /opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin
 
           # C++ ONNX Runtime used by the FM build (envsetup looks in /opt/thirdparty).
-          RUN mkdir -p /opt/thirdparty \
-           && curl -fsSL -o /opt/thirdparty/onnxruntime-linux-x64-${ORT_VERSION}.tgz "${ORT_URL}" \
-           && echo "${ORT_SHA256}  /opt/thirdparty/onnxruntime-linux-x64-${ORT_VERSION}.tgz" | sha256sum -c - \
-           && tar -xzf /opt/thirdparty/onnxruntime-linux-x64-${ORT_VERSION}.tgz -C /opt/thirdparty \
-           && test -d /opt/thirdparty/onnxruntime-linux-x64-${ORT_VERSION}
+          RUN set -eux; \
+              ver="${ORT_VERSION:-1.22.0}"; \
+              url="${ORT_URL:-https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz}"; \
+              sha="${ORT_SHA256:-8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3}"; \
+              test -n "${url}" || { echo "ERROR: ORT_URL is empty"; exit 1; }; \
+              mkdir -p /opt/thirdparty; \
+              tarball="/opt/thirdparty/onnxruntime-linux-x64-${ver}.tgz"; \
+              echo "onnxruntime url = ${url}"; \
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -o "${tarball}" "${url}"; \
+              echo "${sha}  ${tarball}" | sha256sum -c -; \
+              tar -xzf "${tarball}" -C /opt/thirdparty; \
+              test -d "/opt/thirdparty/onnxruntime-linux-x64-${ver}"
 
           # GPU Python packages used by the mounted MX Python 3.11.
           COPY --from=gpu-deps /gpu-pkgs/ \
@@ -177,4 +194,4 @@ jobs:
       - name: Show image size
         run: |
           IMG="ghcr.io/${{ github.repository }}:${{ inputs.tag }}"
-          docker image inspect "$IMG" --format 'image={{.RepoTags}} size={{.Size}
+          docker image inspect "$IMG" --format 'image={{.RepoTags}} size={{.Size}}'
