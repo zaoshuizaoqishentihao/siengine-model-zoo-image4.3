@@ -41,19 +41,144 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Write self-contained Dockerfile
+        run: |
+          cat > Dockerfile <<'DOCKERFILE'
+          # syntax=docker/dockerfile:1.6
+          #
+          # Self-contained ONLINE build of the unified Model Zoo image (GPU + CPU).
+          #
+          # Everything is downloaded from public sources at build time:
+          #   - nvidia/cuda base image (Docker Hub)
+          #   - python:3.11-slim builder (Docker Hub)
+          #   - onnxruntime-gpu / cupy-cuda12x / fastrlock (PyPI, versions pinned)
+          #   - ARM GNU toolchain 10.3-2021.07 (developer.arm.com, checksum verified)
+          #   - onnxruntime C++ 1.22.0 (GitHub releases, sha256 verified)
+          #
+          # Requirements: Docker with network access to Docker Hub, PyPI, GitHub and
+          # developer.arm.com. No local build inputs are needed (single Dockerfile).
+          #
+          # Build:
+          #   docker build -f tools/docker/Dockerfile \
+          #       -t siengine-model-zoo:v0.4.3 tools/docker
+          #
+          # Behind an HTTP proxy:
+          #   docker build -f tools/docker/Dockerfile \
+          #       --build-arg HTTP_PROXY=$http_proxy --build-arg HTTPS_PROXY=$https_proxy \
+          #       -t siengine-model-zoo:v0.4.3 tools/docker
+
+          ARG BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu20.04
+          ARG BUILDER_IMAGE=python:3.11-slim
+
+          ARG TOOLCHAIN_URL=https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.tar.xz
+          ARG TOOLCHAIN_MD5=07bbe2b5277b75ba36a924e9136366a4
+
+          ARG ORT_VERSION=1.22.0
+          ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+          ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
+
+          # ---------------------------------------------------------------------------
+          # Stage 1: GPU Python packages (pinned versions), installed into a target dir.
+          # ---------------------------------------------------------------------------
+          FROM ${BUILDER_IMAGE} AS gpu-deps
+
+          RUN pip install --no-cache-dir --no-deps --target=/gpu-pkgs \
+                onnxruntime-gpu==1.26.0 \
+                cupy-cuda12x==12.3.0 \
+                fastrlock==0.8.3
+
+          RUN test -d /gpu-pkgs/onnxruntime && test -d /gpu-pkgs/cupy
+
+          # ---------------------------------------------------------------------------
+          # Stage 2: runtime image (no Python; Python comes from the mounted MX).
+          # ---------------------------------------------------------------------------
+          FROM ${BASE_IMAGE}
+
+          # ARGs declared before the first FROM are global-only and are NOT inherited by
+          # the stages automatically: re-declare them here WITH their defaults.
+          # (If this block sits in the wrong stage, TOOLCHAIN_URL arrives empty and curl
+          # fails with "URL using bad/illegal format or missing URL".)
+          ARG TOOLCHAIN_URL=https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.tar.xz
+          ARG TOOLCHAIN_MD5=07bbe2b5277b75ba36a924e9136366a4
+          ARG ORT_VERSION=1.22.0
+          ARG ORT_URL=https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+          ARG ORT_SHA256=8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3
+
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                make cmake git wget curl ca-certificates xz-utils vim \
+                zlib1g-dev libc6-dev gcc-multilib g++-multilib \
+                libncurses5 libglib2.0-0 libsm6 libxext6 libxrender-dev libgl1-mesa-glx \
+              && rm -rf /var/lib/apt/lists/* \
+              && ln -s /usr/bin/make /usr/bin/gmake
+
+          # ARM cross toolchain (MX envsetup looks for this exact directory name).
+          # NOTE: the ${VAR:-default} fallbacks keep this working even if the build is
+          # invoked with --build-arg TOOLCHAIN_URL= (empty) or without any build-arg.
+          RUN set -eux; \
+              url="${TOOLCHAIN_URL:-https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.tar.xz}"; \
+              md5="${TOOLCHAIN_MD5:-07bbe2b5277b75ba36a924e9136366a4}"; \
+              test -n "${url}" || { echo "ERROR: TOOLCHAIN_URL is empty"; exit 1; }; \
+              echo "toolchain url = ${url}"; \
+              echo "toolchain md5 = ${md5}"; \
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -o /tmp/toolchain.tar.xz "${url}"; \
+              echo "${md5}  /tmp/toolchain.tar.xz" | md5sum -c -; \
+              tar -xf /tmp/toolchain.tar.xz -C /opt; \
+              rm -f /tmp/toolchain.tar.xz; \
+              test -d /opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin
+
+          # C++ ONNX Runtime used by the FM build (envsetup looks in /opt/thirdparty).
+          RUN set -eux; \
+              ver="${ORT_VERSION:-1.22.0}"; \
+              url="${ORT_URL:-https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz}"; \
+              sha="${ORT_SHA256:-8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3}"; \
+              test -n "${url}" || { echo "ERROR: ORT_URL is empty"; exit 1; }; \
+              mkdir -p /opt/thirdparty; \
+              tarball="/opt/thirdparty/onnxruntime-linux-x64-${ver}.tgz"; \
+              echo "onnxruntime url = ${url}"; \
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -o "${tarball}" "${url}"; \
+              echo "${sha}  ${tarball}" | sha256sum -c -; \
+              tar -xzf "${tarball}" -C /opt/thirdparty; \
+              test -d "/opt/thirdparty/onnxruntime-linux-x64-${ver}"
+
+          # GPU Python packages used by the mounted MX Python 3.11.
+          COPY --from=gpu-deps /gpu-pkgs/ \
+               /opt/siengine/py311-gpu/lib/python3.11/site-packages/
+
+          # Entrypoint (kept self-contained so this Dockerfile is the only file needed).
+          RUN printf '%s\n' \
+                '#!/bin/bash' \
+                'echo ""' \
+                'echo "====================================================="' \
+                'echo "Welcome to use siengine model zoo docker container!"' \
+                'echo "====================================================="' \
+                'echo ""' \
+                'exec "$@"' > /entrypoint.sh \
+           && chmod +x /entrypoint.sh
+
+          RUN test -d /opt/siengine/py311-gpu/lib/python3.11/site-packages/onnxruntime \
+           && test -d /opt/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin \
+           && test -f /opt/thirdparty/onnxruntime-linux-x64-1.22.0.tgz \
+           && test -d /opt/thirdparty/onnxruntime-linux-x64-1.22.0
+
+          WORKDIR /model_zoo
+          ENTRYPOINT ["/entrypoint.sh"]
+          DOCKERFILE
+
       - name: Build image
         run: |
           set -euo pipefail
           docker build --progress=plain \
-            -f tools/docker/Dockerfile \
+            -f Dockerfile \
             -t "siengine-model-zoo-build:${VERSION}" \
-            tools/docker
+            .
 
       - name: Tag before save
         run: |
           set -euo pipefail
-          # The tag saved in the archive becomes the name customers see after
-          # "docker load". Save under the customer-facing name, not the build name.
+          # The tag stored in the archive becomes the name customers see after
+          # "docker load". Save under the customer-facing name.
           docker tag \
             "siengine-model-zoo-build:${VERSION}" \
             "${IMAGE_NAME}:${VERSION}"
