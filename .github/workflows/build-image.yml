@@ -107,11 +107,16 @@ jobs:
           ENV DEBIAN_FRONTEND=noninteractive
 
           RUN apt-get update && apt-get install -y --no-install-recommends \
-                make cmake git wget curl ca-certificates xz-utils vim \
+                make cmake git wget curl ca-certificates xz-utils vim openssh-client \
+                software-properties-common gnupg \
                 zlib1g-dev libc6-dev gcc-multilib g++-multilib \
                 libncurses5 libglib2.0-0 libsm6 libxext6 libxrender-dev libgl1-mesa-glx \
               && rm -rf /var/lib/apt/lists/* \
               && ln -s /usr/bin/make /usr/bin/gmake
+
+          # Keep the pip index configured in the legacy images.
+          RUN mkdir -p /root/.pip && \
+              printf '[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\n' > /root/.pip/pip.conf
 
           # ARM cross toolchain (MX envsetup looks for this exact directory name).
           # NOTE: the ${VAR:-default} fallbacks keep this working even if the build is
